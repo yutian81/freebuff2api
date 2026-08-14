@@ -1,0 +1,116 @@
+name: 发布 Docker 镜像到 GHCR
+
+# 触发条件：
+#   1. push 到 main 分支且构建上下文相关文件（Dockerfile/package.json/server.js/worker.js）变更
+#   2. 手动触发（Actions 页面 → Run workflow），可选是否同时打 latest 标签
+#
+# 镜像地址：ghcr.io/<owner>/freebuff2api
+# 镜像标签：
+#   - <package.json 版本号>   例如 1.7.0
+#   - latest                   （push 到 main 或手动触发且勾选 also_latest 时）
+#   - sha-<短 commit>          唯一可追溯标签
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "package.json"
+      - "server.js"
+      - "worker.js"
+      - ".github/workflows/docker-publish.yml"
+  workflow_dispatch:
+    inputs:
+      also_latest:
+        description: "同时打 latest 标签（默认 true）"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read     # 检出代码
+  packages: write    # 推送镜像到 GHCR
+
+env:
+  IMAGE_NAME: freebuff2api
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 读取 package.json 版本号
+        id: pkg
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📦 package.json version = $VERSION"
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR（GitHub Container Registry）
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签与 labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # 版本号标签（来自 package.json，每次发布都打，覆盖更新）
+            type=raw,value=${{ steps.pkg.outputs.version }}
+            # latest 标签：push 到 main 自动打；手动触发时按输入决定
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.event.inputs.also_latest == 'true' }}
+            # 短 commit SHA，唯一可追溯
+            type=sha,format=short,prefix=sha-
+          labels: |
+            org.opencontainers.image.title=freebuff2api
+            org.opencontainers.image.description=freebuff/codebuff 免费模型 OpenAI 兼容 API（Docker 容器部署）
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ steps.pkg.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions 缓存，加速后续构建
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 输出镜像信息
+        run: |
+          echo "✅ 镜像已发布到 GHCR："
+          echo "${{ steps.meta.outputs.tags }}" | tr ' ' '\n' | sed 's/^/  - /'
+          echo ""
+          echo "拉取命令："
+          FIRST_TAG=$(echo "${{ steps.meta.outputs.tags }}" | cut -d' ' -f1)
+          echo "  docker pull $FIRST_TAG"
+
+      # 清理旧 run jobs：只保留最新 1 条运行记录，节省 Actions 配额
+      # 写法与 build-models-release.yml / extract-token.yml 保持一致
+      - name: clear old run jobs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "deleted: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
